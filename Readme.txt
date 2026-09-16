@@ -1,6 +1,8 @@
-Risc V 32 bit cpu made by me.
+Risc V 32 bit cpu made by jondor.
 
 The cpu will be on discrete logic like 7400 series chips probably 74lvc chips and be printed as a physical pcb.
+
+THe name is super32 because its super and its also 32 bit.
 
 The project was started on 9/10/26 and it started as a c++ simulation file.
 
