@@ -3,11 +3,11 @@
   #include <cstdint>
   #include <vector>
   #include <cstring>
-  #define hex uint32_t
+  #define hex uint32_t //unsigned hex(uses the word hex instaid of uint32_t because its easier to type)
   #define sighex int32_t //signed hex (postive or negative)
   //layed out functions and logic for a cpu, should be risc v, 32 bit, a bit of sram cache, and 128mb of psram
   //goal is for tinycore linux to be booted and have a graphical desktop
-  //should be made of 7400 series chip, specifically dense ones to achive low cost and high clock speeds like 20mhz(not really high but better than others)
+  //should be made of 7400 series chips, specifically dense ones to have it cost less and get high clock speeds like 20mhz(not really high but better than others)
   //globals
   const hex RAM_BASE = 0x80000000;  //where ram starts
   std::vector<uint8_t> ram(1 << 27);     //128 MiB
@@ -26,6 +26,13 @@
   hex funct7; //also weird switching
   hex uimm;   //u type  imm
   hex jimm;  // j type imm
+  hex simm; //s type imm
+  hex shiftam; //shift amount
+  
+  hex sigext(hex v, int bits) { //sign extend
+    hex m = 1u << (bits - 1);
+    return (v ^ m) - m;
+}
 
   hex program[] = {
 0x00C00093, // addi x1, x0, 12
@@ -33,7 +40,19 @@
 0x00A0E193, // ori  x3, x1, 10
 0x00A0C213, // xori x4, x1, 10  
   };
+ hex load(hex addr, int bytes) { //grab a chunk of ram
+  hex a = addr - RAM_BASE;
+  if (a > ram.size() - bytes) { printf("load 0x%08X at pc 0x%08X: processor has exploded\n", addr, pc); exit(1); }
+  hex v = 0;
+  for (int i = 0; i < bytes; i++) v |= (hex)ram[a+i] << (i*8);
+  return v;
+}
 
+void store(hex addr, int bytes, hex val) { //store a chunk of ram
+  hex a = addr - RAM_BASE; //adress minus rams starting point
+  if (a > ram.size() - bytes) { printf("store 0x%08X at pc 0x%08X: processor has exploded\n", addr, pc); exit(1); } //if ram is out of rams size then throw an error
+  for (int i = 0; i < bytes; i++) ram[a+i] = (val >> (i*8)) & 0xFF; 
+}
   hex fetch() {
 
   hex a = pc - RAM_BASE;
@@ -49,6 +68,9 @@
    rs1 = (i >> 15) & 0x1F;
     rs2 = (i >> 20) & 0x1F;
    imm = (i >> 20) & 0xFFF;
+   shiftam = (i >> 20) & 0x1F;
+     simm = ((i >> 7) & 0x1F) | (((i >> 25) & 0x7F) << 5);   //s type imm
+if (simm & 0x800) { simm = simm | 0xFFFFF000; }
    funct7 = (i >> 25) & 0x7F;
    if ( imm & 0x800 ) {
        imm = imm | 0xFFFFF000;}
@@ -69,47 +91,79 @@
   }
  
 void execute(hex insr) {
-switch (opticode) {
+switch (opticode) { //switch should avoid haveing to run through 300 ifs and should be faster and less messy
 
-  case 0x37: x[rd] = uimm;                break;  //lui
+ case 0x37: x[rd] = uimm;                break;  //lui
   case 0x17: x[rd] = pc + uimm;           break;  //auipc
   case 0x6F: x[rd] = pc + 4; nextpc = pc + jimm; break;  //jal
-  case 0x67: { hex t = (x[rs1] + imm) & ~1u; x[rd] = pc + 4; nextpc = t; } break; //jalr
+ case 0x67: { hex t = (x[rs1] + imm) & ~1u; x[rd] = pc + 4; nextpc = t; } break; //jalr (the ~ means invert the number)
 
   case 0x63:                                      //branches
     switch (funct3) {
       case 0: if (x[rs1] == x[rs2]) nextpc = pc + bimm; break; //beq
-      case 1: if (x[rs1] != x[rs2]) nextpc = pc + bimm; break; //bne
+    case 1: if (x[rs1] != x[rs2]) nextpc = pc + bimm; break; //bne
       case 4: if (sighex(x[rs1]) <  sighex(x[rs2])) nextpc = pc + bimm; break; //blt
-      case 5: if (sighex(x[rs1]) >= sighex(x[rs2])) nextpc = pc + bimm; break; //bge
+    case 5: if (sighex(x[rs1]) >= sighex(x[rs2])) nextpc = pc + bimm; break; //bge
       case 6: if (x[rs1] <  x[rs2]) nextpc = pc + bimm; break; //bltu
       case 7: if (x[rs1] >= x[rs2]) nextpc = pc + bimm; break; //bgeu
-      default: goto bad;
+      default: goto bad; //sends stuff to bad where it throws an error
     }
   break;
-  case 0x13:                                 
+  case 0x13:                  //reading of the riscv datasheet so i cant make everything in order               
     switch (funct3) {
-      case 0: x[rd] = x[rs1] + imm; break;  //addi
-   case 4: x[rd] = x[rs1] ^ imm; break;  //xori
-    case 6: x[rd] = x[rs1] | imm; break;  //ori
-     case 7: x[rd] = x[rs1] & imm; break;  //andi
-     default: goto bad;                    //slti sltiu slli srli srai
+      case 0: x[rd] = x[rs1] + imm; break;  //addi (add to immediate like addi x1, x0, 11)
+   case 4: x[rd] = x[rs1] ^ imm; break;  //xori  (xor the bits together)
+    case 6: x[rd] = x[rs1] | imm; break;  //ori (just or the bits together)
+     case 7: x[rd] = x[rs1] & imm; break;  //andi (and the bits together)
+     case 2: x[rd] = sighex(x[rs1]) < sighex(imm) ? 1 : 0; break; //slti (? basically is (if this)?(then this):(if not then this);)
+     case 3: x[rd] = hex(x[rs1]) < hex(imm) ? 1 : 0; break;//sltiu (just sltiu but unsigned)
+     case 1:x[rd] = x[rs1] << shiftam; break; //slli (shifting)
+     case 5:funct7 == 0 ? x[rd] = hex(x[rs1]) >> shiftam : x[rd] = sighex(x[rs1]) >> shiftam; break; //srli and srai
+     default: goto bad;                    
     }
     break;
-  case 0x33:                                      //ALU register
-    switch (funct3) {
-      case 0: x[rd] = (funct7 == 0x20) ? x[rs1] - x[rs2] : x[rs1] + x[rs2]; break; //add/sub
-      default: goto bad;                    //sll slt sltu xor srl sra or and
-    }
- break;
-
-  case 0x03: goto bad;                            //loads  lb lh lw lbu lhu
-case 0x23: goto bad;                            //stores sb sh sw
-  case 0x73: goto bad;                            //system ecall ebreak
+  case 0x33:                    //datasheet was in order here                  
+    switch (funct3) { //everything here just compares/ operates with registers
+      case 0: funct7 ==0 ? x[rd] = x[rs1]+ x[rs2] : x[rd] = x[rs1] - x[rs2]; break; //add and sub
+      case 1: x[rd] = x[rs1] << (x[rs2] & 31); break; //sll
+      case 2: x[rd] = sighex(x[rs1]) < sighex(x[rs2]) ? 1:0; break; //slt 
+      case 3: x[rd] = hex(x[rs1]) < hex(x[rs2]) ? 1:0; break; // sltu (slt but unsigned )
+      case 4: x[rd] = x[rs1] ^ x[rs2]; break; //xor
+      case 5: funct7 ==0 ? x[rd] = hex(x[rs1]) >> hex(x[rs2] & 31) : x[rd] = sighex(x[rs1]) >> sighex(x[rs2] & 31); break; //srl and sra
+      case 6: x[rd] = x[rs1] | x[rs2]; break; //or
+      case 7: x[rd] = x[rs1] & x[rs2]; break; //and
+      default: goto bad;                    
+    }break;
+    case 0x23: {                                    //storing stuff into ram
+  hex addr = x[rs1] + simm;
+  switch (funct3) {
+    case 0: store(addr,1,x[rs2]); break;  //sb (pretty simple, all the stuff here just calls a function)
+    case 1: store(addr,2,x[rs2]); break;  //sh
+    case 2: store(addr,4,x[rs2]); break;  //sw
+    default: goto bad;
+  }
+} break;
+case 0x03: {                                    //loads stuff into ram
+  hex addr = x[rs1] + imm;
+  switch (funct3) {
+    case 0: x[rd] = sigext(load(addr,1), 8);  break;  //lb
+    case 1: x[rd] = sigext(load(addr,2), 16); break;  //lh
+    case 2: x[rd] = load(addr,4);             break;  //lw
+    case 4: x[rd] = load(addr,1);             break;  //lbu (no sigext = zero extend)
+    case 5: x[rd] = load(addr,2);             break;  //lhu
+    default: goto bad;
+  }
+} break;
+  case 0x73:
+  switch (insr >> 20) {       //these are just empty cor now, nothing needs them i think
+    case 0x000:  break; //ecall
+    case 0x001:  break; //ebreak
+    default: goto bad;
+  }break;
 
   default:
-  bad:
-    printf("unknown instruction 0x%08X at pc 0x%08X , expect processer to detonate\n", insr, pc);
+  bad: //takes care of errors
+    printf("unknown instruction 0x%08X at pc 0x%08X , expect processer to detonate\n", insr, pc); //send stuff here if it errors
     exit(1);
 }
 x[0] = 0; //register 0 is always 0
@@ -118,19 +172,19 @@ x[0] = 0; //register 0 is always 0
 
   int main() {
 
-  std::memcpy(ram.data(), program, sizeof(program));
+  std::memcpy(ram.data(), program, sizeof(program)); //extract program
   for(;;) { //loop
-  nextpc = pc +4;
+  nextpc = pc +4; //predict what pc should be, can change with loops
   hex b = fetch();
-      if(b==0) {break;}
+      if(b==0) {break;} //quit if there are no instructions
 
-  printf("0x%08X\n", b);
+  printf("0x%08X\n", b); //print instrcutions for debug
 
-  decode(b);
+  decode(b);//function calls
   execute(b);
-  pc= nextpc;
+  pc= nextpc; // move up porgram counter to what nextpc wants it to move up
 
   }
    std::cout<<"\ncpu done \n"; //debug
-   printf("x1=%d x2=%d x3=%d x4=%d\n", x[1], x[2], x[3], x[4]);
+   printf("x1=%d x2=%d x3=%d x4=%d\n", x[1], x[2], x[3], x[4]); //print register values here for debugging
   }
