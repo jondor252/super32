@@ -48,7 +48,8 @@
   return v;
 }
 
-void store(hex addr, int bytes, hex val) { //store a chunk of ram
+void store(hex addr, int bytes, hex val) {
+  if (addr == 0x10000000) { putchar(val & 0xFF); return; }   //uart exeption
   hex a = addr - RAM_BASE; //adress minus rams starting point
   if (a > ram.size() - bytes) { printf("store 0x%08X at pc 0x%08X: processor has exploded\n", addr, pc); exit(1); } //if ram is out of rams size then throw an error
   for (int i = 0; i < bytes; i++) ram[a+i] = (val >> (i*8)) & 0xFF; 
@@ -80,7 +81,6 @@ if (simm & 0x800) { simm = simm | 0xFFFFF000; }
        bimm = bimm | (((i >> 31) & 1) << 12);
 
        if((bimm & 0x1000)!=0) {bimm = bimm | 0xFFFFE000;}
-       printf("bimm=0x%X\n", bimm);
        uimm = i & 0xFFFFF000;
 
        jimm = ((i >> 21) & 0x3FF) << 1; // have to repeat all this for j type too
@@ -170,15 +170,13 @@ x[0] = 0; //register 0 is always 0
 }
 
 
-  int main() {
-
-  std::memcpy(ram.data(), program, sizeof(program)); //extract program
+int main(int argc, char** argv) {
+  if (argc > 1) { FILE* f = fopen(argv[1], "rb"); fread(ram.data(), 1, ram.size(), f); fclose(f); } //executable file insertion 
+  else std::memcpy(ram.data(), program, sizeof(program));
   for(;;) { //loop
   nextpc = pc +4; //predict what pc should be, can change with loops
   hex b = fetch();
       if(b==0) {break;} //quit if there are no instructions
-
-  printf("0x%08X\n", b); //print instrcutions for debug
 
   decode(b);//function calls
   execute(b);
@@ -186,5 +184,4 @@ x[0] = 0; //register 0 is always 0
 
   }
    std::cout<<"\ncpu done \n"; //debug
-   printf("x1=%d x2=%d x3=%d x4=%d\n", x[1], x[2], x[3], x[4]); //print register values here for debugging
   }
