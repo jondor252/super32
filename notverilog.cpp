@@ -5,6 +5,8 @@
   #include <cstring>
   #define hex uint32_t //unsigned hex(uses the word hex instaid of uint32_t because its easier to type)
   #define sighex int32_t //signed hex (postive or negative)
+  #define n64hex uint64_t //unsigned 64 bit hex needed for mulh and its buds
+  #define sign64hex int64_t //signed 64 bit hex for the same reason as unsigned but signed
   //layed out functions and logic for a cpu, should be risc v, 32 bit, a bit of sram cache, and 128mb of psram
   //goal is for tinycore linux to be booted and have a graphical desktop
   //should be made of 7400 series chips, specifically dense ones to have it cost less and get high clock speeds like 20mhz(not really high but better than others)
@@ -124,14 +126,34 @@ switch (opticode) { //switch should avoid haveing to run through 300 ifs and sho
     break;
   case 0x33:                    //datasheet was in order here                  
     switch (funct3) { //everything here just compares/ operates with registers
-      case 0: funct7 ==0 ? x[rd] = x[rs1]+ x[rs2] : x[rd] = x[rs1] - x[rs2]; break; //add and sub
-      case 1: x[rd] = x[rs1] << (x[rs2] & 31); break; //sll
-      case 2: x[rd] = sighex(x[rs1]) < sighex(x[rs2]) ? 1:0; break; //slt 
-      case 3: x[rd] = hex(x[rs1]) < hex(x[rs2]) ? 1:0; break; // sltu (slt but unsigned )
-      case 4: x[rd] = x[rs1] ^ x[rs2]; break; //xor
-      case 5: funct7 ==0 ? x[rd] = hex(x[rs1]) >> hex(x[rs2] & 31) : x[rd] = sighex(x[rs1]) >> sighex(x[rs2] & 31); break; //srl and sra
-      case 6: x[rd] = x[rs1] | x[rs2]; break; //or
-      case 7: x[rd] = x[rs1] & x[rs2]; break; //and
+      case 0: switch(funct7) { //layering more switches for mul and div
+          case 0: x[rd] = x[rs1] + x[rs2] ; break; //add
+          case 1: x[rd] = x[rs1] * x[rs2]; break; //mul
+          case 0x20: x[rd] = x[rs1] - x[rs2];break; //sub
+          default: goto bad;
+      }
+       break;     //use 64 bits to shift up for mulh mullsu and mulhu
+      case 1:funct7 == 0 ? x[rd] = x[rs1] << (x[rs2] & 31) :   x[rd] = (sign64hex(sighex(x[rs1])) * sign64hex(sighex(x[rs2] ))) >> 32; break; //sll and mulh
+      case 2: funct7 == 0 ? x[rd] = sighex(x[rs1]) < sighex(x[rs2]) ? 1:0 : x[rd] = (sign64hex(sighex(x[rs1])) * n64hex(hex(x[rs2])))  >> 32; break; //slt and mulhsu
+      case 3: funct7 == 0? x[rd] = hex(x[rs1]) < hex(x[rs2]) ? 1:+0 : x[rd] = (n64hex(hex(x[rs1])) * n64hex(hex(x[rs2] ))) >>32; break; // sltu (slt but unsigned ) and mulhu
+      case 4: if(funct7 == 0) { x[rd] = x[rs1] ^ x[rs2] ;} //xor
+      else {  // div
+  if (x[rs2] == 0) x[rd] = 0xFFFFFFFF;
+  else if (x[rs1] == 0x80000000 && x[rs2] == 0xFFFFFFFF) x[rd] = 0x80000000;
+  else x[rd] = sighex(x[rs1]) / sighex(x[rs2]); } break; 
+      case 5: switch(funct7) {
+        case 0: x[rd] = hex(x[rs1]) >> hex(x[rs2] & 31) ; break; //srl
+        case 1:if (x[rs2] == 0) {x[rd] = 0xFFFFFFFF;} else x[rd] = hex(x[rs1]) / hex(x[rs2]); break; //divu
+        case 0x20: x[rd] = sighex(x[rs1]) >> sighex(x[rs2] & 31); break; //sra
+        default: goto bad;
+      } break;
+      case 6:if( funct7 == 0 ) { x[rd] = x[rs1] | x[rs2] ;}  //extreml dumb layering becuase divide by 0 is so imprtant
+      else {if(x[rs2] == 0) {x[rd] = x[rs1];} 
+      else if (x[rs1] == 0x80000000 && x[rs2] == 0xFFFFFFFF) {x[rd] = 0;}
+       else {x[rd] = sighex(x[rs1]) % sighex(x[rs2]);}} break; //or and rem
+      case 7: if(funct7 == 0) { x[rd] = x[rs1] & x[rs2];} 
+      else if(x[rs2] == 0) {x[rd] = x[rs1];}
+       else  {x[rd] = hex(x[rs1]) % hex(x[rs2]);} break; //and and remu
       default: goto bad;                    
     }break;
     case 0x23: {                                    //storing stuff into ram
