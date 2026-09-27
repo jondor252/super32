@@ -2,3 +2,4 @@ notverilog
 *.o
 *.out
 tempCodeRunnerFile.*
+*.bin
