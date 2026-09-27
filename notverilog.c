@@ -1,8 +1,8 @@
-   
-#include <iostream>
-  #include <cstdint>
-  #include <vector>
-  #include <cstring>
+
+#include <stdio.h>
+#include <stdlib.h>
+  #include <stdint.h>
+  #include <string.h>
   #define hex uint32_t //unsigned hex(uses the word hex instaid of uint32_t because its easier to type)
   #define sighex int32_t //signed hex (postive or negative)
   #define n64hex uint64_t //unsigned 64 bit hex needed for mulh and its buds
@@ -12,7 +12,7 @@
   //should be made of 7400 series chips, specifically dense ones to have it cost less and get high clock speeds like 20mhz(not really high but better than others)
   //globals
   const hex RAM_BASE = 0x80000000;  //where ram starts
-  std::vector<uint8_t> ram(1 << 27);     //128 MiB
+  uint8_t ram[1 << 27];     //128 MiB
   hex x[32];  //32 cpu registers
   hex pc = RAM_BASE; //program counter
   hex nextpc;   // go to the next instruction
@@ -30,21 +30,29 @@
   hex jimm;  // j type imm
   hex simm; //s type imm
   hex shiftam; //shift amount
-  
+  hex casreg[4096]; //control and status register, 12 bit(2^12 = 4096)
+  hex casx; // magic expression to get csr's value
+  hex tempx; //temporary holder for csr
+  hex minen; //interrupt enable bits
+  hex mpp; //prvious privledge mode
+  hex mpie; //previose interrupt enable
+  hex priv = 3; //privlidge of the cpu starting at machine which is 3
+
+
   hex sigext(hex v, int bits) { //sign extend
     hex m = 1u << (bits - 1);
     return (v ^ m) - m;
 }
 
-  hex program[] = {
+  hex program[] = { //example, not used anymore because i use the file inserts to test
 0x00C00093, // addi x1, x0, 12
 0x00A0F113, // andi x2, x1, 10
 0x00A0E193, // ori  x3, x1, 10
-0x00A0C213, // xori x4, x1, 10  
+0x00A0C213, // xori x4, x1, 10
   };
  hex load(hex addr, int bytes) { //grab a chunk of ram
   hex a = addr - RAM_BASE;
-  if (a > ram.size() - bytes) { printf("load 0x%08X at pc 0x%08X: processor has exploded\n", addr, pc); exit(1); }
+  if (a > sizeof(ram) - bytes) { printf("load 0x%08X at pc 0x%08X: processor has exploded\n", addr, pc); exit(1); }
   hex v = 0;
   for (int i = 0; i < bytes; i++) v |= (hex)ram[a+i] << (i*8);
   return v;
@@ -53,24 +61,38 @@
 void store(hex addr, int bytes, hex val) {
   if (addr == 0x10000000) { putchar(val & 0xFF); return; }   //uart exeption
   hex a = addr - RAM_BASE; //adress minus rams starting point
-  if (a > ram.size() - bytes) { printf("store 0x%08X at pc 0x%08X: processor has exploded\n", addr, pc); exit(1); } //if ram is out of rams size then throw an error
-  for (int i = 0; i < bytes; i++) ram[a+i] = (val >> (i*8)) & 0xFF; 
+  if (a > sizeof(ram) - bytes) { printf("store 0x%08X at pc 0x%08X: processor has exploded\n", addr, pc); exit(1); } //if ram is out of rams size then throw an error
+  for (int i = 0; i < bytes; i++) ram[a+i] = (val >> (i*8)) & 0xFF;
 }
   hex fetch() {
 
   hex a = pc - RAM_BASE;
-       if (a > ram.size() - 4) {printf("pc 0x%08X: processor has exploded\n", pc); exit(1);} //invalid ram error
+       if (a > sizeof(ram) - 4) {printf("pc 0x%08X: processor has exploded\n", pc); exit(1);} //invalid ram error
   return ram[a] | (hex)ram[a+1] << 8 | (hex)ram[a+2] << 16 | (hex)ram[a+3] << 24;
-  
+
+  }
+  void trap(hex reason, hex tval) {
+    casreg[0x341] = pc;
+    casreg[0x342] = reason;
+    nextpc = casreg[0x305] & ~3u;
+    casreg[0x343] =tval;
+     hex mie = (casreg[0x300] >> 3) & 1;
+casreg[0x300] &= ~(1u << 7);    // clear mpie
+casreg[0x300] |= mie << 7;      // save mie into it
+     casreg[0x300] &= ~(1u << 3);
+     casreg[0x300] &= ~(3u << 11); //clear mpp
+     casreg[0x300] |= priv << 11; //save mie into it
+    priv = 3;
   }
   void decode(hex i) {
-
+  //example - ex = (i >> (starting bit #) ) & 0x(size of number);
    opticode = i & 0x7F ;
    rd = (i >> 7) & 0x1F;
    funct3 = (i >> 12) & 0x07;
    rs1 = (i >> 15) & 0x1F;
     rs2 = (i >> 20) & 0x1F;
    imm = (i >> 20) & 0xFFF;
+   minen = ( casreg[0x300] >> 3 ) & 0x1;
    shiftam = (i >> 20) & 0x1F;
      simm = ((i >> 7) & 0x1F) | (((i >> 25) & 0x7F) << 5);   //s type imm
 if (simm & 0x800) { simm = simm | 0xFFFFF000; }
@@ -91,8 +113,9 @@ if (simm & 0x800) { simm = simm | 0xFFFFF000; }
        jimm = jimm | (((i >> 31) & 1) << 20);
        if (jimm & 0x100000) { jimm = jimm | 0xFFE00000; }
   }
- 
+
 void execute(hex insr) {
+  casx = (insr >> 20) & 0xFFF;  //csr
 switch (opticode) { //switch should avoid haveing to run through 300 ifs and should be faster and less messy
 
  case 0x37: x[rd] = uimm;                break;  //lui
@@ -104,27 +127,27 @@ switch (opticode) { //switch should avoid haveing to run through 300 ifs and sho
     switch (funct3) {
       case 0: if (x[rs1] == x[rs2]) nextpc = pc + bimm; break; //beq
     case 1: if (x[rs1] != x[rs2]) nextpc = pc + bimm; break; //bne
-      case 4: if (sighex(x[rs1]) <  sighex(x[rs2])) nextpc = pc + bimm; break; //blt
-    case 5: if (sighex(x[rs1]) >= sighex(x[rs2])) nextpc = pc + bimm; break; //bge
+      case 4: if ((sighex)x[rs1] <  (sighex)x[rs2]) nextpc = pc + bimm; break; //blt
+    case 5: if ((sighex)x[rs1] >= (sighex)x[rs2]) nextpc = pc + bimm; break; //bge
       case 6: if (x[rs1] <  x[rs2]) nextpc = pc + bimm; break; //bltu
       case 7: if (x[rs1] >= x[rs2]) nextpc = pc + bimm; break; //bgeu
       default: goto bad; //sends stuff to bad where it throws an error
     }
   break;
-  case 0x13:                  //reading of the riscv datasheet so i cant make everything in order               
+  case 0x13:                  //reading of the riscv datasheet so i cant make everything in order
     switch (funct3) {
       case 0: x[rd] = x[rs1] + imm; break;  //addi (add to immediate like addi x1, x0, 11)
    case 4: x[rd] = x[rs1] ^ imm; break;  //xori  (xor the bits together)
     case 6: x[rd] = x[rs1] | imm; break;  //ori (just or the bits together)
      case 7: x[rd] = x[rs1] & imm; break;  //andi (and the bits together)
-     case 2: x[rd] = sighex(x[rs1]) < sighex(imm) ? 1 : 0; break; //slti (? basically is (if this)?(then this):(if not then this);)
-     case 3: x[rd] = hex(x[rs1]) < hex(imm) ? 1 : 0; break;//sltiu (just sltiu but unsigned)
+     case 2: x[rd] = (sighex)x[rs1] < (sighex)imm ? 1 : 0; break; //slti (? basically is (if this)?(then this):(if not then this);)
+     case 3: x[rd] = (hex)x[rs1] < (hex)imm ? 1 : 0; break;//sltiu (just sltiu but unsigned)
      case 1:x[rd] = x[rs1] << shiftam; break; //slli (shifting)
-     case 5:funct7 == 0 ? x[rd] = hex(x[rs1]) >> shiftam : x[rd] = sighex(x[rs1]) >> shiftam; break; //srli and srai
-     default: goto bad;                    
+     case 5:x[rd] = funct7 == 0 ? (hex)x[rs1] >> shiftam : (sighex)x[rs1] >> shiftam; break; //srli and srai
+     default: goto bad;
     }
     break;
-  case 0x33:                    //datasheet was in order here                  
+  case 0x33:                    //datasheet was in order here
     switch (funct3) { //everything here just compares/ operates with registers
       case 0: switch(funct7) { //layering more switches for mul and div
           case 0: x[rd] = x[rs1] + x[rs2] ; break; //add
@@ -133,28 +156,28 @@ switch (opticode) { //switch should avoid haveing to run through 300 ifs and sho
           default: goto bad;
       }
        break;     //use 64 bits to shift up for mulh mullsu and mulhu
-      case 1:funct7 == 0 ? x[rd] = x[rs1] << (x[rs2] & 31) :   x[rd] = (sign64hex(sighex(x[rs1])) * sign64hex(sighex(x[rs2] ))) >> 32; break; //sll and mulh
-      case 2: funct7 == 0 ? x[rd] = sighex(x[rs1]) < sighex(x[rs2]) ? 1:0 : x[rd] = (sign64hex(sighex(x[rs1])) * n64hex(hex(x[rs2])))  >> 32; break; //slt and mulhsu
-      case 3: funct7 == 0? x[rd] = hex(x[rs1]) < hex(x[rs2]) ? 1:+0 : x[rd] = (n64hex(hex(x[rs1])) * n64hex(hex(x[rs2] ))) >>32; break; // sltu (slt but unsigned ) and mulhu
+      case 1: x[rd] = funct7 == 0 ? x[rs1] << (x[rs2] & 31) :  (sign64hex)(sighex)x[rs1] * (sign64hex)(sighex)x[rs2]  >> 32; break; //sll and mulh
+      case 2: x[rd] = funct7 == 0 ? (sighex)x[rs1] < (sighex)x[rs2] ? 1:0 : (sign64hex)(sighex)x[rs1] * (n64hex)(hex)x[rs2]  >> 32; break; //slt and mulhsu
+      case 3: x[rd] = funct7 == 0 ? (hex)x[rs1] < (hex)x[rs2] ? 1:+0 : (n64hex)(hex)x[rs1] * (n64hex)(hex)x[rs2] >>32; break; // sltu (slt but unsigned ) and mulhu
       case 4: if(funct7 == 0) { x[rd] = x[rs1] ^ x[rs2] ;} //xor
       else {  // div
   if (x[rs2] == 0) x[rd] = 0xFFFFFFFF;
   else if (x[rs1] == 0x80000000 && x[rs2] == 0xFFFFFFFF) x[rd] = 0x80000000;
-  else x[rd] = sighex(x[rs1]) / sighex(x[rs2]); } break; 
+  else x[rd] = (sighex)x[rs1] / (sighex)x[rs2]; } break;
       case 5: switch(funct7) {
-        case 0: x[rd] = hex(x[rs1]) >> hex(x[rs2] & 31) ; break; //srl
-        case 1:if (x[rs2] == 0) {x[rd] = 0xFFFFFFFF;} else x[rd] = hex(x[rs1]) / hex(x[rs2]); break; //divu
-        case 0x20: x[rd] = sighex(x[rs1]) >> sighex(x[rs2] & 31); break; //sra
+        case 0: x[rd] = (hex)x[rs1] >> (hex)(x[rs2] & 31) ; break; //srl
+        case 1:if (x[rs2] == 0) {x[rd] = 0xFFFFFFFF;} else x[rd] = (hex)x[rs1] / (hex)x[rs2]; break; //divu
+        case 0x20: x[rd] = (sighex)x[rs1] >> (sighex)(x[rs2] & 31); break; //sra
         default: goto bad;
       } break;
       case 6:if( funct7 == 0 ) { x[rd] = x[rs1] | x[rs2] ;}  //extreml dumb layering becuase divide by 0 is so imprtant
-      else {if(x[rs2] == 0) {x[rd] = x[rs1];} 
+      else {if(x[rs2] == 0) {x[rd] = x[rs1];}
       else if (x[rs1] == 0x80000000 && x[rs2] == 0xFFFFFFFF) {x[rd] = 0;}
-       else {x[rd] = sighex(x[rs1]) % sighex(x[rs2]);}} break; //or and rem
-      case 7: if(funct7 == 0) { x[rd] = x[rs1] & x[rs2];} 
+       else {x[rd] = (sighex)x[rs1] % (sighex)x[rs2];}} break; //or and rem
+      case 7: if(funct7 == 0) { x[rd] = x[rs1] & x[rs2];}
       else if(x[rs2] == 0) {x[rd] = x[rs1];}
-       else  {x[rd] = hex(x[rs1]) % hex(x[rs2]);} break; //and and remu
-      default: goto bad;                    
+       else  {x[rd] = (hex)x[rs1] % (hex)x[rs2];} break; //and and remu
+      default: goto bad;
     }break;
     case 0x23: {                                    //storing stuff into ram
   hex addr = x[rs1] + simm;
@@ -177,10 +200,20 @@ case 0x03: {                                    //loads stuff into ram
   }
 } break;
   case 0x73:
-  switch (insr >> 20) {       //these are just empty cor now, nothing needs them i think
-    case 0x000:  break; //ecall
-    case 0x001:  break; //ebreak
-    default: goto bad;
+  switch (funct3) {
+    case 0:
+     switch (insr >> 20) {       //these are just empty cor now, nothing needs them i think
+     case 0x000:  break; //ecall
+     case 0x001:  break; //ebreak
+     default: goto bad;
+  }break; //temporaily save casregs original value and then operate with it
+  case 1: tempx = casreg[casx]; casreg[casx] = x[rs1]; x[rd] = tempx; break; //csrrw
+  case 2: tempx = casreg[casx]; if(rs1 != 0) { casreg[casx] = (tempx | x[rs1]);  }  x[rd] = tempx; break; //csrrs
+  case 3: tempx = casreg[casx]; if(rs1 != 0) { casreg[casx] = (tempx & ~x[rs1]); } x[rd] = tempx; break; //csrrc
+  case 5: tempx = casreg[casx]; casreg[casx] = rs1; x[rd] = tempx; break; //csrrwi
+case 6: tempx = casreg[casx]; if(rs1 != 0) { casreg[casx] = (tempx | rs1);  } x[rd] = tempx; break; //csrrsi
+case 7: tempx = casreg[casx]; if(rs1 != 0) { casreg[casx] = (tempx & ~rs1); } x[rd] = tempx; break; //csrrci
+   default: goto bad;
   }break;
 
   default:
@@ -193,8 +226,8 @@ x[0] = 0; //register 0 is always 0
 
 
 int main(int argc, char** argv) {
-  if (argc > 1) { FILE* f = fopen(argv[1], "rb"); fread(ram.data(), 1, ram.size(), f); fclose(f); } //executable file insertion 
-  else std::memcpy(ram.data(), program, sizeof(program));
+  if (argc > 1) { FILE* f = fopen(argv[1], "rb"); fread(ram, 1, sizeof(ram), f); fclose(f); } //executable file insertion
+  else memcpy(ram, program, sizeof(program));
   for(;;) { //loop
   nextpc = pc +4; //predict what pc should be, can change with loops
   hex b = fetch();
@@ -202,8 +235,8 @@ int main(int argc, char** argv) {
 
   decode(b);//function calls
   execute(b);
-  pc= nextpc; // move up porgram counter to what nextpc wants it to move up
+  pc= nextpc; // move up program counter to what nextpc wants it to move up
 
   }
-   std::cout<<"\ncpu done \n"; //debug
+   printf("\ncpu done \n"); //debug
   }
