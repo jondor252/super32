@@ -37,7 +37,10 @@
   hex mpp; //prvious privledge mode
   hex mpie; //previose interrupt enable
   hex priv = 3; //privlidge of the cpu starting at machine which is 3
-
+  n64hex time7 = 0; //needed for time
+  n64hex timecmp5 = 0xFFFFFFFFFFFFFFFF; //also for time
+  hex resaddr;
+  hex resvalid;
 
   hex sigext(hex v, int bits) { //sign extend
     hex m = 1u << (bits - 1);
@@ -51,6 +54,10 @@
 0x00A0C213, // xori x4, x1, 10
   };
  hex load(hex addr, int bytes) { //grab a chunk of ram
+   if (addr == 0x0200BFF8) return time7;              // time7 low
+   if (addr == 0x0200BFFC) return time7 >> 32;        // time7 high
+   if (addr == 0x02004000) return timecmp5;           // timecmp5 low
+   if (addr == 0x02004004) return timecmp5 >> 32;     // timecmp5 high
   hex a = addr - RAM_BASE;
   if (a > sizeof(ram) - bytes) { printf("load 0x%08X at pc 0x%08X: processor has exploded\n", addr, pc); exit(1); }
   hex v = 0;
@@ -59,7 +66,12 @@
 }
 
 void store(hex addr, int bytes, hex val) {
+  n64hex fkval = val <<(0 + 0 - 0 * 0); //nothing
+  n64hex numb5 =  0xFFFFFFFF00000000;
+    if( addr == 0x02004000) { timecmp5 = ((timecmp5 & numb5)|fkval); return; }
+  if( addr == 0x02004004) { timecmp5 = ((timecmp5 & 0xFFFFFFFF) | (fkval << 32)); return;}
   if (addr == 0x10000000) { putchar(val & 0xFF); return; }   //uart exeption
+  if (addr == 0x10000005) {}
   hex a = addr - RAM_BASE; //adress minus rams starting point
   if (a > sizeof(ram) - bytes) { printf("store 0x%08X at pc 0x%08X: processor has exploded\n", addr, pc); exit(1); } //if ram is out of rams size then throw an error
   for (int i = 0; i < bytes; i++) ram[a+i] = (val >> (i*8)) & 0xFF;
@@ -69,9 +81,9 @@ void store(hex addr, int bytes, hex val) {
   hex a = pc - RAM_BASE;
        if (a > sizeof(ram) - 4) {printf("pc 0x%08X: processor has exploded\n", pc); exit(1);} //invalid ram error
   return ram[a] | (hex)ram[a+1] << 8 | (hex)ram[a+2] << 16 | (hex)ram[a+3] << 24;
-
   }
-  void trap(hex reason, hex tval) {
+  void trap(hex reason, hex tval) { //didnt feel like making 50 globals here
+    if(casreg[0x305] == 0) {printf("trap failed because %u\n", reason); exit(1);}
     casreg[0x341] = pc;
     casreg[0x342] = reason;
     nextpc = casreg[0x305] & ~3u;
@@ -81,9 +93,25 @@ casreg[0x300] &= ~(1u << 7);    // clear mpie
 casreg[0x300] |= mie << 7;      // save mie into it
      casreg[0x300] &= ~(1u << 3);
      casreg[0x300] &= ~(3u << 11); //clear mpp
-     casreg[0x300] |= priv << 11; //save mie into it
+     casreg[0x300] |= priv << 11; //save priv into it
+     resvalid = 0;
     priv = 3;
   }
+ void mret() { //same with here just opposite of a trap
+  nextpc = casreg[0x341]; //nextpc = mpc
+  priv = (casreg[0x300] >>11 ) & 3; //priv = mpp
+  casreg[0x300] &= ~(1u << 3);                        // clear mie
+  casreg[0x300] |= ((casreg[0x300] >> 7) & 1) << 3;   // mie = mpie
+  casreg[0x300] |= (1u << 7);//mpie =1
+  (casreg[0x300] &= ~(3u << 11 ));
+}
+ void clint() { //clint does timer interrupts
+   if(time7 >= timecmp5) {casreg[0x344] |= 0x80;}
+   else{ casreg[0x344] &= ~0x80;}
+   if (casreg[0x344] & 0x80 && (casreg[0x300] & 8) && (casreg[0x304] & 0x80)) { //check if time7 is over timecmp5 and check mstatus.mie and mie.mite
+      trap(0x80000007, 0);
+  }
+}
   void decode(hex i) {
   //example - ex = (i >> (starting bit #) ) & 0x(size of number);
    opticode = i & 0x7F ;
@@ -179,6 +207,32 @@ switch (opticode) { //switch should avoid haveing to run through 300 ifs and sho
        else  {x[rd] = (hex)x[rs1] % (hex)x[rs2];} break; //and and remu
       default: goto bad;
     }break;
+      case 0x2F: {    //atomics
+        hex old = load(x[rs1],4);
+        switch (insr >> 27) {
+          case 0x02:  x[rd] = old; resaddr = x[rs1]; resvalid =1; ;break; //lr.w
+          case 0x03:  if (resvalid && resaddr == x[rs1]) {store(x[rs1], 4, x[rs2]); x[rd] = 0;} else {x[rd] = 1;} resvalid = 0; ;break; //sc.w
+          case 0x01:  store(x[rs1], 4, x[rs2]);
+          x[rd] = old; ;break; //amoswap.w
+          case 0x00: store(x[rs1], 4, old + x[rs2]);
+          x[rd] = old;break; //amoadd.w
+          case 0x04:  store(x[rs1], 4, old ^ x[rs2]);
+          x[rd] = old ;break; //amoxor.w
+          case 0x0C: store(x[rs1], 4, old & x[rs2]);
+          x[rd] = old  ;break; //amoand.w
+          case 0x08:  store(x[rs1], 4, old | x[rs2]);
+          x[rd] = old  ;break; //amoor.w
+          case 0x10:  store(x[rs1], 4, (sighex)old < (sighex)x[rs2] ? old : x[rs2]);
+          x[rd] = old  ;break; //amomin.w
+          case 0x14: store(x[rs1], 4, (sighex)old > (sighex)x[rs2] ? old : x[rs2]);
+          x[rd] = old ;break; //amomax.w
+          case 0x18: store(x[rs1], 4, (hex)old < (hex)x[rs2] ? old : x[rs2]);
+          x[rd] = old  ;break; //amoinu.w
+          case 0x1C: store(x[rs1], 4, (hex)old > (hex)x[rs2] ? old : x[rs2]);
+          x[rd] = old  ;break; //amomaxu.w
+          default: goto bad;
+        }
+      }break;
     case 0x23: {                                    //storing stuff into ram
   hex addr = x[rs1] + simm;
   switch (funct3) {
@@ -200,12 +254,16 @@ case 0x03: {                                    //loads stuff into ram
   }
 } break;
   case 0x73:
+     casreg[0xC01] = time7; //fence
+    casreg[0xC81] = time7 >> 32;
   switch (funct3) {
     case 0:
      switch (insr >> 20) {       //these are just empty cor now, nothing needs them i think
-     case 0x000:  break; //ecall
-     case 0x001:  break; //ebreak
+     case 0x000: trap(8 + priv, 0); break; //ecall
+     case 0x001: trap(3, pc); break; //ebreak
+        case 0x105: ; break; //wfi
      default: goto bad;
+     case 0x302: mret(); break; //mret
   }break; //temporaily save casregs original value and then operate with it
   case 1: tempx = casreg[casx]; casreg[casx] = x[rs1]; x[rd] = tempx; break; //csrrw
   case 2: tempx = casreg[casx]; if(rs1 != 0) { casreg[casx] = (tempx | x[rs1]);  }  x[rd] = tempx; break; //csrrs
@@ -215,18 +273,19 @@ case 6: tempx = casreg[casx]; if(rs1 != 0) { casreg[casx] = (tempx | rs1);  } x[
 case 7: tempx = casreg[casx]; if(rs1 != 0) { casreg[casx] = (tempx & ~rs1); } x[rd] = tempx; break; //csrrci
    default: goto bad;
   }break;
+   case 0x0F:break;
 
   default:
   bad: //takes care of errors
-    printf("unknown instruction 0x%08X at pc 0x%08X , expect processer to detonate\n", insr, pc); //send stuff here if it errors
-    exit(1);
+  trap(2, insr);
 }
 x[0] = 0; //register 0 is always 0
 }
 
 
 int main(int argc, char** argv) {
-  if (argc > 1) { FILE* f = fopen(argv[1], "rb"); fread(ram, 1, sizeof(ram), f); fclose(f); } //executable file insertion
+  casreg[0x301] = 0x40001100;
+ if (argc > 1) { FILE* f = fopen(argv[1], "rb"); if (!f) { printf("cant open %s\n", argv[1]); return 1; } fread(ram, 1, sizeof(ram), f); fclose(f); } //exucutatble file insertion with a check
   else memcpy(ram, program, sizeof(program));
   for(;;) { //loop
   nextpc = pc +4; //predict what pc should be, can change with loops
@@ -235,8 +294,9 @@ int main(int argc, char** argv) {
 
   decode(b);//function calls
   execute(b);
-  pc= nextpc; // move up program counter to what nextpc wants it to move up
-
+  time7++;
+  clint();
+  pc =nextpc;// move up program counter to what nextpc wants it to move up
   }
    printf("\ncpu done \n"); //debug
   }
