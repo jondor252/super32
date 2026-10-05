@@ -12,5 +12,7 @@ When the c++ version is finished I will move onto verilog.
 
 c++ version has been moved to c becuase it is more predictable and more suted for this project.
 
+emulator core has been finished and linux has been booted.
+
 The end goal is to boot tinycore linux or a graphical distro on it and get display out from vga or another common display cord, the specs will probably be 128mb of psram, 16mb of sram as cache, flip flops for registers, and probably multiple pcbs to fit everything.
 
