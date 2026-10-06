@@ -6,6 +6,7 @@
 #include <termios.h>
 #include <unistd.h>
 #include <poll.h>
+#include <setjmp.h>
 #define hex uint32_t //unsigned hex(uses the word hex instaid of uint32_t because its easier to type)
 #define sighex int32_t //signed hex (postive or negative)
 #define n64hex uint64_t //unsigned 64 bit hex needed for mulh and its buds
@@ -49,11 +50,9 @@ hex bgfxglb;
 hex ier;
 uint8_t rxbyte; //waiting key
 hex rxhave; //if a key is waiting or not
-
+hex mask = 0xC0122;
+void trap(hex reason, hex tval);
 struct termios saved;
-
-
-
 
 hex sigext(hex v, int bits) { //sign extend
   hex m = 1u << (bits - 1);
@@ -75,9 +74,95 @@ void helpfn() {
   int f = poll(&p, 1, 0);
   if(f == 1) {read(0, &rxbyte, 1); rxhave=1;}
 }
+int csrexists(hex addr) {
+  switch (addr) {
+    case 0x100: case 0x104: case 0x105: case 0x106: case 0x140: case 0x141: case 0x142: case 0x143: case 0x144: case 0x180:
+    case 0x300: case 0x301: case 0x302: case 0x303: case 0x304: case 0x305: case 0x306: case 0x310:
+    case 0x340: case 0x341: case 0x342: case 0x343: case 0x344:
+    case 0xF11: case 0xF12: case 0xF13: case 0xF14:
+    case 0xC00: case 0xC01: case 0xC02: case 0xC80: case 0xC81: case 0xC82:
+    case 0xB00: case 0xB02: case 0xB80: case 0xB82:
+      return 1;
+  }
+  return 0;
+}
+hex csrread(hex addr) {
+  if(addr == 0x100) {return casreg[0x300] & mask;}
+  if(addr ==  0x104) {return casreg[0x304] & casreg[0x303];}
+  if(addr ==  0x144) {return casreg[0x344] & casreg[0x303];}
+  if(addr == 0xC00 || addr == 0xC01 || addr == 0xC02 || addr == 0xB00 || addr == 0xB02) {return time7;} //one instruction per tick so cycle, time and instret are the same
+  if(addr == 0xC80 || addr == 0xC81 || addr == 0xC82 || addr == 0xB80 || addr == 0xB82) {return time7 >> 32;}
+  return  casreg[addr];
+}
+void csrwrite(hex addr, hex val) {
+  if(addr == 0x100) {casreg[0x300] = (casreg[0x300] & ~mask) | (val & mask);}
+  else if(addr == 0x104) { casreg[0x304] =(casreg[0x304] & ~casreg[0x303]) | (val & casreg[0x303]);}
+  else if(addr == 0x144) { casreg[0x344] =(casreg[0x344] & ~casreg[0x303]) | (val & casreg[0x303]);}
+  else(casreg[addr] = val);
+}
+void sret() {
+  nextpc = casreg[0x141];
+  priv = (casreg[0x300] >> 8) & 1;
+  casreg[0x300] &= ~(1u << 1);
+  casreg[0x300] |= ((casreg[0x300] >> 5) & 1) << 1;
+  casreg[0x300] |= (1u << 5);
+  casreg[0x300] &= ~(1u << 8);
+}
+hex pteread(hex pa) { //page table entries are 4 bytes in physical ram
+  hex a = pa - RAM_BASE;
+  if (a > sizeof(ram) - 4) return 0; //outside ram counts as invalid
+  return ram[a] | (hex)ram[a+1] << 8 | (hex)ram[a+2] << 16 | (hex)ram[a+3] << 24;
+}
+void ptewrite(hex pa, hex val) {
+  hex a = pa - RAM_BASE;
+  for (int i = 0; i < 4; i++) ram[a+i] = (val >> (i*8)) & 0xFF;
+}
+jmp_buf pfjmp; //jumps back to the main loop so a faulting instruction never finishes
+void pagefault(int type, hex vaddr) {
+  hex cause = 13; //load
+  if(type == 2) {cause = 15;} //store
+  if(type == 3) {cause = 12;} //fetch
+  trap(cause, vaddr);
+  longjmp(pfjmp, 1);
+}
+hex translate(hex vaddr, int type) { //the most annoying part, the mmu, type 1 load 2 store 3 fetch
+  hex vpn1 = vaddr >> 22;
+  hex vpn0 = (vaddr >> 12) & 0x3FF;
+  hex offset = vaddr & 0xFFF;
+  hex p = priv;
+  hex pa;
+  if(type != 3 && priv == 3 && (casreg[0x300] & (1u << 17))){ p = (casreg[0x300] >> 11) & 3;}
+  if (p == 3 || !(casreg[0x180] >> 31)) return vaddr;
+  hex a = (casreg[0x180] & 0x3FFFFF) * 4096;
+  hex pteaddr = a + vpn1 * 4;
+  hex pte = pteread(pteaddr);
+  if(!(pte & 1) || ((pte & 4) && !(pte & 2))) {pagefault(type, vaddr);}
+  if(pte & 0xA) {
+    if((pte >> 10) & 0x3FF) {pagefault(type, vaddr);}
+    pa = ((pte >> 20) << 22) | (vaddr & 0x3FFFFF);
+  }
+  else {
+    a = (pte >> 10) * 4096;
+    pteaddr = a + vpn0 * 4;
+    pte = pteread(pteaddr);
+    if(!(pte & 1) || ((pte & 4) && !(pte & 2))) {pagefault(type, vaddr);}
+    if(!(pte & 0xA)) {pagefault(type, vaddr);}
+    pa = ((pte >> 10) << 12) | offset;
+  }
+  if(type == 3 && !(pte & 8)) {pagefault(type, vaddr);}
+  if(type == 1 && !((pte & 2) || ((pte & 8) && (casreg[0x300] & (1u << 19))))) {pagefault(type, vaddr);}
+  if(type == 2 && !(pte & 4)) {pagefault(type, vaddr);}
+  if(p == 0 && !(pte & 0x10)) {pagefault(type, vaddr);}
+  if(p == 1 && (pte & 0x10) && (type == 3 || !(casreg[0x300] & (1u << 18)))) {pagefault(type, vaddr);}
+  hex newpte = pte | 0x40 | (type == 2 ? 0x80 : 0);
+  if(newpte != pte) {ptewrite(pteaddr, newpte);}
+  return pa;
+}
 hex load(hex addr, int bytes) { //grab a chunk of ram
+  addr = translate(addr, 1);
   if (addr == 0x0200BFF8) return time7;              // time7 low
   if (addr == 0x0200BFFC) return time7 >> 32;        // time7 high
+  if (addr == 0x02000000) return (casreg[0x344] >> 3) & 1; //msip, software interrupt
   if (addr == 0x02004000) return timecmp5;           // timecmp5 low
   if (addr == 0x02004004) return timecmp5 >> 32;     // timecmp5 high
   if (addr == 0x10000005) if (addr == 0x10000005) {helpfn(); return 0x60 | rxhave;}//uart ready
@@ -97,8 +182,10 @@ hex load(hex addr, int bytes) { //grab a chunk of ram
 }
 
 void store(hex addr, int bytes, hex val) {
+  addr = translate(addr, 2);
   n64hex fkval = val <<(0 + 0 - 0 * 0); //nothing
   n64hex numb5 =  0xFFFFFFFF00000000;
+  if( addr == 0x02000000) { if(val & 1) {casreg[0x344] |= 8;} else {casreg[0x344] &= ~8u;} return; } //msip sets mip.msip
   if( addr == 0x02004000) { timecmp5 = ((timecmp5 & numb5)|fkval); return; }
   if( addr == 0x02004004) { timecmp5 = ((timecmp5 & 0xFFFFFFFF) | (fkval << 32)); return;}
   if (addr == 0x10000000) { if ((bgfxglb & 0x80) == 0) {putchar(val & 0xFF); } return; }   //uart exeption
@@ -114,11 +201,29 @@ void store(hex addr, int bytes, hex val) {
   for (int i = 0; i < bytes; i++) ram[a+i] = (val >> (i*8)) & 0xFF;
 }
 hex fetch() {
-  hex a = pc - RAM_BASE;
+  hex a = translate(pc, 3) - RAM_BASE;
   if (a > sizeof(ram) - 4) {printf("pc 0x%08X: processor has exploded\n", pc); exit(1);} //invalid ram error
   return ram[a] | (hex)ram[a+1] << 8 | (hex)ram[a+2] << 16 | (hex)ram[a+3] << 24;
 }
 void trap(hex reason, hex tval) { //didnt feel like making 50 globals here
+  hex cause = reason & 0x7FFFFFFF;
+  hex deleg = (reason >> 31) ? casreg[0x303] : casreg[0x302];
+  if (priv <= 1 && ((deleg >> cause) & 1)) {
+    casreg[0x141] = pc;
+    casreg[0x142] = reason;
+    casreg[0x143] = tval;
+    hex sie = (casreg[0x300] >> 1) & 1;
+    casreg[0x300] &= ~(1u << 5);
+    casreg[0x300] |= sie << 5;
+    casreg[0x300] &= ~(1u << 1);
+     casreg[0x300] &= ~(1u << 8);
+    casreg[0x300] |= priv << 8;
+     nextpc = casreg[0x105] & ~3u;
+     priv =1;
+     resvalid = 0;
+     noti = 1;
+     return;
+  }
   if(casreg[0x305] == 0) {printf("trap failed because %u\n", reason); exit(1);}
   casreg[0x341] = pc;
   casreg[0x342] = reason;
@@ -145,9 +250,10 @@ void mret() { //same with here just opposite of a trap
 void clint() { //clint does timer interrupts
   if(time7 >= timecmp5) {casreg[0x344] |= 0x80;}
   else{ casreg[0x344] &= ~0x80;}
-  if (casreg[0x344] & 0x80 && (casreg[0x300] & 8) && (casreg[0x304] & 0x80)) { //check if time7 is over timecmp5 and check mstatus.mie and mie.mite
+  if (casreg[0x344] & 0x80 && (((casreg[0x300] & 8) || priv < 3)) && (casreg[0x304] & 0x80)) { //check if time7 is over timecmp5 and check mstatus.mie and mie.mite
     trap(0x80000007, 0);
   }
+    else if((casreg[0x344] & 0x20 )&& (casreg[0x304] & 0x20 ) && (casreg[0x303] & 0x20 )&& (priv == 0 || (priv == 1 && (casreg[0x300] & 2)))) {trap(0x80000005, 0);}
 }
 void decode(hex i) {
   //example - ex = (i >> (starting bit #) ) & 0x(size of number);
@@ -245,6 +351,7 @@ void execute(hex insr) {
                 default: goto bad;
               }break;
                 case 0x2F: {    //atomics
+                  if((insr >> 27) != 0x02) {translate(x[rs1], 2);} //amos fault as stores
                   hex old = load(x[rs1],4);
                   switch (insr >> 27) {
                     case 0x02:  x[rd] = old; resaddr = x[rs1]; resvalid =1; ;break; //lr.w
@@ -291,23 +398,23 @@ void execute(hex insr) {
                           }
                         } break;
                             case 0x73:
-                              casreg[0xC01] = time7; //fence
-                              casreg[0xC81] = time7 >> 32;
                               switch (funct3) {
                                 case 0:
+                                  if(funct7 == 0x09) break; //sfence.vma, no tlb to flush
                                   switch (insr >> 20) {       //these are just empty cor now, nothing needs them i think
                                     case 0x000: trap(8 + priv, 0); break; //ecall
                                     case 0x001: trap(3, pc); break; //ebreak
                                     case 0x105: ; break; //wfi
+                                    case 0x102: sret(); break;
                                     default: goto bad;
                                     case 0x302: mret(); break; //mret
                                   }break; //temporaily save casregs original value and then operate with it
-                                    case 1: tempx = casreg[casx]; casreg[casx] = x[rs1]; x[rd] = tempx; break; //csrrw
-                                    case 2: tempx = casreg[casx]; if(rs1 != 0) { casreg[casx] = (tempx | x[rs1]);  }  x[rd] = tempx; break; //csrrs
-                                    case 3: tempx = casreg[casx]; if(rs1 != 0) { casreg[casx] = (tempx & ~x[rs1]); } x[rd] = tempx; break; //csrrc
-                                    case 5: tempx = casreg[casx]; casreg[casx] = rs1; x[rd] = tempx; break; //csrrwi
-                                    case 6: tempx = casreg[casx]; if(rs1 != 0) { casreg[casx] = (tempx | rs1);  } x[rd] = tempx; break; //csrrsi
-                                    case 7: tempx = casreg[casx]; if(rs1 != 0) { casreg[casx] = (tempx & ~rs1); } x[rd] = tempx; break; //csrrci
+                                    case 1: if(!csrexists(casx)) goto bad; tempx = csrread(casx); csrwrite(casx, x[rs1]); x[rd] = tempx; break; //csrrw
+                                    case 2: if(!csrexists(casx)) goto bad; tempx = csrread(casx); if(rs1 != 0) { csrwrite(casx, (tempx | x[rs1]));  }  x[rd] = tempx; break; //csrrs
+                                    case 3: if(!csrexists(casx)) goto bad; tempx = csrread(casx); if(rs1 != 0) { csrwrite(casx, (tempx & ~x[rs1])); } x[rd] = tempx; break; //csrrc
+                                    case 5: if(!csrexists(casx)) goto bad; tempx = csrread(casx); csrwrite(casx, rs1); x[rd] = tempx; break; //csrrwi
+                                    case 6: if(!csrexists(casx)) goto bad; tempx = csrread(casx); if(rs1 != 0) { csrwrite(casx, (tempx | rs1));  } x[rd] = tempx; break; //csrrsi
+                                    case 7: if(!csrexists(casx)) goto bad; tempx = csrread(casx); if(rs1 != 0) { csrwrite(casx, (tempx & ~rs1)); } x[rd] = tempx; break; //csrrci
                                     default: goto bad;
                               }break;
                                     case 0x0F:break;
@@ -321,7 +428,7 @@ void execute(hex insr) {
 void restore() { tcsetattr(0, TCSANOW, &saved); }
 
 int main(int argc, char** argv) {
-  casreg[0x301] = 0x40001100;
+  casreg[0x301] = 0x40141101;
   tcgetattr(0, &saved);
   struct termios raw = saved;
   raw.c_lflag &= ~(ICANON | ECHO);
@@ -334,9 +441,11 @@ int main(int argc, char** argv) {
     nextpc = pc +4; //predict what pc should be, can change with loops
     clint(); //check for traps
     if(noti == 0) {
-      hex b = fetch(); //fetch
-      decode(b);//function calls
-      execute(b);
+      if(setjmp(pfjmp) == 0) { //a page fault lands back here with 1 and skips the rest
+        hex b = fetch(); //fetch
+        decode(b);//function calls
+        execute(b);
+      }
     }
     time7++;
     pc =nextpc;// move up program counter to what nextpc wants it to move up
